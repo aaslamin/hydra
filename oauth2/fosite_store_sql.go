@@ -73,6 +73,9 @@ const (
 	sqlTablePKCE    = "pkce"
 )
 
+type contextKey string
+var transactionKey = contextKey("transaction")
+
 var Migrations = map[string]*dbal.PackrMigrationSource{
 	dbal.DriverMySQL: dbal.NewMustPackerMigrationSource(logrus.New(), AssetNames(), Asset, []string{
 		"migrations/sql/shared",
@@ -201,6 +204,7 @@ func (s *FositeSQLStore) hashSignature(signature, table string) string {
 
 func (s *FositeSQLStore) createSession(ctx context.Context, signature string, requester fosite.Requester, table string) error {
 	signature = s.hashSignature(signature, table)
+	op := s.operator(ctx)
 
 	data, err := sqlSchemaFromRequest(signature, requester, s.L)
 	if err != nil {
@@ -213,7 +217,7 @@ func (s *FositeSQLStore) createSession(ctx context.Context, signature string, re
 		strings.Join(sqlParams, ", "),
 		":"+strings.Join(sqlParams, ", :"),
 	)
-	if _, err := s.DB.NamedExecContext(ctx, query, data); err != nil {
+	if _, err := op.NamedExecContext(ctx, query, data); err != nil {
 		return sqlcon.HandleError(err)
 	}
 	return nil
@@ -221,9 +225,10 @@ func (s *FositeSQLStore) createSession(ctx context.Context, signature string, re
 
 func (s *FositeSQLStore) findSessionBySignature(ctx context.Context, signature string, session fosite.Session, table string) (fosite.Requester, error) {
 	signature = s.hashSignature(signature, table)
+	op := s.operator(ctx)
 
 	var d sqlData
-	if err := s.DB.GetContext(ctx, &d, s.DB.Rebind(fmt.Sprintf("SELECT * FROM hydra_oauth2_%s WHERE signature=?", table)), signature); err == sql.ErrNoRows {
+	if err := op.GetContext(ctx, &d, op.Rebind(fmt.Sprintf("SELECT * FROM hydra_oauth2_%s WHERE signature=?", table)), signature); err == sql.ErrNoRows {
 		return nil, errors.Wrap(fosite.ErrNotFound, "")
 	} else if err != nil {
 		return nil, sqlcon.HandleError(err)
@@ -241,9 +246,10 @@ func (s *FositeSQLStore) findSessionBySignature(ctx context.Context, signature s
 }
 
 func (s *FositeSQLStore) deleteSession(ctx context.Context, signature string, table string) error {
+	op := s.operator(ctx)
 	signature = s.hashSignature(signature, table)
 
-	if _, err := s.DB.ExecContext(ctx, s.DB.Rebind(fmt.Sprintf("DELETE FROM hydra_oauth2_%s WHERE signature=?", table)), signature); err != nil {
+	if _, err := op.ExecContext(ctx, op.Rebind(fmt.Sprintf("DELETE FROM hydra_oauth2_%s WHERE signature=?", table)), signature); err != nil {
 		return sqlcon.HandleError(err)
 	}
 	return nil
@@ -279,7 +285,8 @@ func (s *FositeSQLStore) GetAuthorizeCodeSession(ctx context.Context, signature 
 }
 
 func (s *FositeSQLStore) InvalidateAuthorizeCodeSession(ctx context.Context, signature string) error {
-	if _, err := s.DB.ExecContext(ctx, s.DB.Rebind(fmt.Sprintf(
+	op := s.operator(ctx)
+	if _, err := op.ExecContext(ctx, op.Rebind(fmt.Sprintf(
 		"UPDATE hydra_oauth2_%s SET active=false WHERE signature=?",
 		sqlTableCode,
 	)), signature); err != nil {
@@ -338,7 +345,8 @@ func (s *FositeSQLStore) RevokeAccessToken(ctx context.Context, id string) error
 }
 
 func (s *FositeSQLStore) revokeSession(ctx context.Context, id string, table string) error {
-	if _, err := s.DB.ExecContext(ctx, s.DB.Rebind(fmt.Sprintf("DELETE FROM hydra_oauth2_%s WHERE request_id=?", table)), id); err == sql.ErrNoRows {
+	op := s.operator(ctx)
+	if _, err := op.ExecContext(ctx, op.Rebind(fmt.Sprintf("DELETE FROM hydra_oauth2_%s WHERE request_id=?", table)), id); err == sql.ErrNoRows {
 		return errors.Wrap(fosite.ErrNotFound, "")
 	} else if err != nil {
 		return sqlcon.HandleError(err)
@@ -354,4 +362,54 @@ func (s *FositeSQLStore) FlushInactiveAccessTokens(ctx context.Context, notAfter
 	}
 
 	return nil
+}
+
+// internal convenience interface to keep storage methods DRY otherwise there will be hella lot of copy-pasta
+// note sure if this is the best way to go about this tho ¯\_(ツ)_/¯
+type operatorExtContext interface {
+	sqlx.ExtContext
+	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error)
+}
+
+// helper used to determine whether we are dealing with a transaction or not. name is kinda shitty?
+func (s *FositeSQLStore) operator(ctx context.Context) (operatorExtContext) {
+	if txn, ok := ctx.Value(transactionKey).(*sqlx.Tx); ok {
+		s.L.Infof("AMIR -------------------------- OPERATOR IS TXN - %+v", txn)
+		return txn
+	} else {
+		return s.DB
+	}
+}
+
+func (s *FositeSQLStore) BeginTX(ctx context.Context) (context.Context, error) {
+	if txn, err := s.DB.BeginTxx(ctx, nil); err != nil {
+		s.L.Errorf("AMIR -------------------------- BeginTX TRANSACTION ERROR: %+v", err)
+		return ctx, err
+	} else {
+		s.L.Infof("AMIR -------------------------- BeginTX SUCCESS: %+v", txn)
+		return context.WithValue(ctx, transactionKey, txn), nil
+	}
+}
+
+func (s *FositeSQLStore) Commit(ctx context.Context) error {
+	if txn, ok := ctx.Value(transactionKey).(*sqlx.Tx); ok {
+		s.L.Infof("AMIR -------------------------- COMMITING TRANSACTION")
+		return txn.Commit()
+	} else {
+		// TODO: probably don't want to panic here. Although it if this method is called by fosite
+		// it's because you said you support transactions! So...are you lying?
+		panic("no transaction available in context - wtf not cool man.")
+	}
+}
+
+func (s *FositeSQLStore) Rollback(ctx context.Context) error {
+	if txn, ok := ctx.Value(transactionKey).(*sqlx.Tx); ok {
+		s.L.Infof("AMIR -------------------------- Rollback TRANSACTION")
+		return txn.Rollback()
+	} else {
+		// TODO: probably don't want to panic here. Although it if this method is called by fosite
+		// it's because you said you support transactions! So...are you lying?
+		panic("no transaction available in context - wtf not cool man.")
+	}
 }
